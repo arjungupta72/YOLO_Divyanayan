@@ -21,38 +21,41 @@ class DrawImages(private val context: Context) {
         ContextCompat.getColor(context, R.color.overlay_orange)
     }
 
-    fun invoke(results: List<SegmentationResult>) : Bitmap {
-        if (results.isEmpty()) return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+    // Add green for the "Stable/Locked" state
+    private val greenColorInt by lazy {
+        ContextCompat.getColor(context, R.color.overlay_green)
+    }
+
+    // Update signature to return DetectionState and accept isLocked
+    fun invoke(results: List<SegmentationResult>, isLocked: Boolean = false) : DetectionState {
+        if (results.isEmpty()) return DetectionState(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888), false, 0.0)
 
         val width = results.first().mask[0].size
         val height = results.first().mask.size
         val combined = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(combined)
 
+        var foundQuad = false
+        var bestArea = 0.0
+        val currentColor = if (isLocked) greenColorInt else orangeColorInt
+
         results.forEach { result ->
-            // --- PART 1: Draw the Semi-Transparent Mask ---
+            // --- Mask Drawing ---
             for (y in 0 until height) {
                 for (x in 0 until width) {
                     if (result.mask[y][x] > 0.5f) {
-                        combined.setPixel(x, y, applyTransparentOverlayColor(orangeColorInt))
+                        combined.setPixel(x, y, applyTransparentOverlayColor(currentColor))
                     }
                 }
             }
 
-            // --- PART 2: Draw the Approximated Quad Outline ---
+            // --- Quad Detection & Area Logic ---
             val maskMat = floatArrayToMat(result.mask, width, height)
             val contours = ArrayList<MatOfPoint>()
             val hierarchy = Mat()
 
-            Imgproc.findContours(
-                maskMat,
-                contours,
-                hierarchy,
-                Imgproc.RETR_EXTERNAL,
-                Imgproc.CHAIN_APPROX_SIMPLE
-            )
-
-            contours.sortByDescending { Imgproc.contourArea(it) }
+            Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            contours.sortByDescending { Imgproc.contourArea(it) } // Largest first
 
             for (contour in contours) {
                 if (Imgproc.contourArea(contour) < 2000.0) {
@@ -66,35 +69,35 @@ class DrawImages(private val context: Context) {
 
                 Imgproc.approxPolyDP(contour2f, approx, 0.02 * perimeter, true)
 
+                // Geometric Validity Check: Exactly 4 points
                 if (approx.total() == 4L) {
-                    // Draw the outline using the orange color
-                    drawOpenCVPoly(canvas, approx)
+                    foundQuad = true
+                    bestArea = Imgproc.contourArea(approx) // Extract Area for stability tracking
+                    drawOpenCVPoly(canvas, approx, currentColor)
 
                     contour2f.release()
                     approx.release()
                     contour.release()
-                    break
+                    break // Focus on the primary document
                 }
-
                 contour2f.release()
                 approx.release()
                 contour.release()
             }
-
             maskMat.release()
             hierarchy.release()
         }
 
-        return combined
+        return DetectionState(combined, foundQuad, bestArea)
     }
 
-    private fun drawOpenCVPoly(canvas: Canvas, poly: MatOfPoint2f) {
+    private fun drawOpenCVPoly(canvas: Canvas, poly: MatOfPoint2f, colorInt: Int) {
         val points = poly.toArray()
         if (points.isEmpty()) return
 
         val paint = Paint().apply {
-            color = orangeColorInt // Fixed to orange
-            strokeWidth = 8F
+            color = colorInt
+            strokeWidth = 10F // Slightly thicker for better visibility
             style = Paint.Style.STROKE
             isAntiAlias = true
         }
@@ -105,7 +108,6 @@ class DrawImages(private val context: Context) {
             path.lineTo(points[i].x.toFloat(), points[i].y.toFloat())
         }
         path.close()
-
         canvas.drawPath(path, paint)
     }
 

@@ -1,5 +1,12 @@
 package com.surendramaran.yolov11instancesegmentation
 
+import android.content.ContentValues
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Environment
+import android.provider.MediaStore
+import java.io.IOException
 import kotlin.math.exp
 
 object ImageUtils {
@@ -26,7 +33,33 @@ object ImageUtils {
 
         return output
     }
+    fun saveAndCropBitmap(context: Context, fullBitmap: Bitmap, box: Output0): Uri? {
+        // 1. Calculate Crop Coordinates (converting normalized 0.0-1.0 to pixel values)
+        val left = (box.x1 * fullBitmap.width).toInt().coerceAtLeast(0)
+        val top = (box.y1 * fullBitmap.height).toInt().coerceAtLeast(0)
+        val width = ((box.x2 - box.x1) * fullBitmap.width).toInt().coerceAtMost(fullBitmap.width - left)
+        val height = ((box.y2 - box.y1) * fullBitmap.height).toInt().coerceAtMost(fullBitmap.height - top)
 
+        val croppedBitmap = Bitmap.createBitmap(fullBitmap, left, top, width, height)
+
+        // 2. Save to Gallery using MediaStore
+        val filename = "SCAN_${System.currentTimeMillis()}.jpg"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+        }
+
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+// In saveAndCropBitmap function
+        uri?.let {
+            // Add the safe call ?. before use
+            context.contentResolver.openOutputStream(it)?.use { stream ->
+                croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+            } ?: throw IOException("Failed to open output stream.")
+        }
+        return uri
+    }
 
     fun Array<FloatArray>.toMask(): Array<IntArray> =
         map { row -> row.map { if (it > 0) 1 else 0 }.toIntArray() }.toTypedArray()

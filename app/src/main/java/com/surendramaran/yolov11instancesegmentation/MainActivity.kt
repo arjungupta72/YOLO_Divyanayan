@@ -1,10 +1,16 @@
 package com.surendramaran.yolov11instancesegmentation
 
 import android.Manifest
+import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Matrix
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -29,6 +35,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import org.opencv.android.OpenCVLoader
+import java.io.IOException
 
 class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentationListener {
     private lateinit var binding: ActivityMainBinding
@@ -37,7 +44,16 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     private lateinit var previewView: PreviewView
     private var isModelReady = false
 
+    // Stability Tracker Variables
+    private var stableFrameCount = 0
+    private var lastArea = 0.0
+    private var isLocked = false
+
+    private val AREA_THRESHOLD = 0.10 // 10% allowed variance in area
+    private val REQUIRED_STABLE_FRAMES = 10 // Approx 1 second at 30fps
+    private var isCapturing = false
     override fun onCreate(savedInstanceState: Bundle?) {
+
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         
@@ -55,7 +71,14 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
 
         //  CRITICAL FIX: Initialize models in background thread
         showLoadingUI(true)
-        
+        // In onCreate or similar initialization block
+        binding.ivTop.setOnClickListener {
+            isCapturing = false
+            isLocked = false
+            stableFrameCount = 0
+            startCamera() // Re-bind the camera preview and analyzer
+            Toast.makeText(this, "Scanner Ready", Toast.LENGTH_SHORT).show()
+        }
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // Load OpenCV in background
@@ -212,13 +235,106 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         preProcessTime: Long,
         postProcessTime: Long
     ) {
-        val image = drawImages.invoke(results)
+        // Step 1: Pass the current 'isLocked' state to the drawer
+        val detectionState = drawImages.invoke(results, isLocked)
+
         runOnUiThread {
-            binding.tvPreprocess.text = preProcessTime.toString()
-            binding.tvInference.text = interfaceTime.toString()
-            binding.tvPostprocess.text = postProcessTime.toString()
-            binding.ivTop.setImageBitmap(image)
+            // Step 2: Run Stability Logic
+            updateStability(detectionState, results)
+
+            // Step 3: Update UI
+            binding.tvPreprocess.text = "Pre: ${preProcessTime}ms"
+            binding.tvInference.text = "Inf: ${interfaceTime}ms"
+            binding.tvPostprocess.text = "Post: ${postProcessTime}ms"
+            binding.ivTop.setImageBitmap(detectionState.bitmap)
         }
+    }
+    private fun updateStability(state: DetectionState, results: List<SegmentationResult>) {
+        if (isCapturing) return
+        if (state.isQuadFound) {
+            // Check Area Stability: current area vs last frame's area
+            val areaDiff = if (lastArea > 0) Math.abs(state.area - lastArea) / lastArea else 0.0
+
+            if (areaDiff <= AREA_THRESHOLD) {
+                stableFrameCount++
+                Log.d("StabilityTracker", "Stabilizing: $stableFrameCount/$REQUIRED_STABLE_FRAMES")
+            } else {
+                // Reset if the document moved too much
+                stableFrameCount = 0
+                Log.d("StabilityTracker", "Reset: Movement (Diff: ${String.format("%.2f", areaDiff)})")
+            }
+
+            lastArea = state.area
+        } else {
+            if (stableFrameCount > 0) Log.d("StabilityTracker", "Reset: Quad lost")
+            // Reset if no quad is detected (Geometric Validity failure)
+            stableFrameCount = 0
+            lastArea = 0.0
+        }
+        val wasLocked = isLocked
+        // Final Stability Check
+        isLocked = stableFrameCount >= REQUIRED_STABLE_FRAMES
+        if (isLocked && !wasLocked) {
+            Log.i("StabilityTracker", "🟢 DOCUMENT LOCKED - STABILITY ACHIEVED")
+        }
+        if (isLocked && !isCapturing && results.isNotEmpty()) {
+            captureDocument(state, results.first())
+        }
+    }
+    private fun captureDocument(state: DetectionState, result: SegmentationResult) {
+        if (isCapturing) return
+        isCapturing = true
+
+        // 1. Stop the Camera Analyzer immediately to "freeze" the frame
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider = cameraProviderFuture.get()
+            cameraProvider.unbindAll() // This stops the preview and analyzer
+        }, ContextCompat.getMainExecutor(this))
+
+        // 2. Play Sound
+        val view = window.decorView
+        view.playSoundEffect(android.view.SoundEffectConstants.CLICK)
+
+        // 3. Save and Crop
+        lifecycleScope.launch(Dispatchers.IO) {
+            val uri = saveAndCropBitmap(this@MainActivity, state.bitmap, result.box)
+
+            withContext(Dispatchers.Main) {
+                if (uri != null) {
+                    Toast.makeText(this@MainActivity, "Saved to Gallery", Toast.LENGTH_LONG).show()
+                    // Show the final cropped version on top
+                    binding.ivTop.setImageBitmap(state.bitmap)
+                }
+            }
+        }
+    }
+    fun saveAndCropBitmap(context: Context, fullBitmap: Bitmap, box: Output0): Uri? {
+        // 1. Calculate Crop Coordinates (converting normalized 0.0-1.0 to pixel values)
+        val left = (box.x1 * fullBitmap.width).toInt().coerceAtLeast(0)
+        val top = (box.y1 * fullBitmap.height).toInt().coerceAtLeast(0)
+        val width = ((box.x2 - box.x1) * fullBitmap.width).toInt().coerceAtMost(fullBitmap.width - left)
+        val height = ((box.y2 - box.y1) * fullBitmap.height).toInt().coerceAtMost(fullBitmap.height - top)
+
+        val croppedBitmap = Bitmap.createBitmap(fullBitmap, left, top, width, height)
+
+        // 2. Save to Gallery using MediaStore
+        val filename = "SCAN_${System.currentTimeMillis()}.jpg"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
+        }
+
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+// In saveAndCropBitmap function
+        uri?.let {
+            // Add the safe call ?. before use
+            context.contentResolver.openOutputStream(it)?.use { stream ->
+                croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
+            } ?: throw IOException("Failed to open output stream.")
+        }
+        return uri
     }
 
     override fun onEmpty() {
