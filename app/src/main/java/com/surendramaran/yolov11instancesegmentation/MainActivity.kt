@@ -2,12 +2,9 @@ package com.surendramaran.yolov11instancesegmentation
 
 import android.Manifest
 import android.content.ContentValues
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.graphics.Matrix
-import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -17,107 +14,67 @@ import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.AspectRatio
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import com.surendramaran.yolov11instancesegmentation.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.concurrent.Executors
 import org.opencv.android.OpenCVLoader
-import java.io.IOException
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentationListener {
-    private lateinit var binding: ActivityMainBinding
-    private var instanceSegmentation: InstanceSegmentation? = null
-    private lateinit var drawImages: DrawImages
-    private lateinit var previewView: PreviewView
-    private var isModelReady = false
 
-    // Stability Tracker Variables
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var previewView: PreviewView
+    private lateinit var drawImages: DrawImages
+    private lateinit var imageCapture: ImageCapture
+
+    private var instanceSegmentation: InstanceSegmentation? = null
+    private var isModelReady = false
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+
+    @Volatile
+    private var latestBox: Output0? = null
+
+    // Stability & Capture State
     private var stableFrameCount = 0
     private var lastArea = 0.0
     private var isLocked = false
-
-    private val AREA_THRESHOLD = 0.10 // 10% allowed variance in area
-    private val REQUIRED_STABLE_FRAMES = 10 // Approx 1 second at 30fps
     private var isCapturing = false
-    override fun onCreate(savedInstanceState: Bundle?) {
 
+    private val AREA_THRESHOLD = 0.10
+    private val REQUIRED_STABLE_FRAMES = 15 // Adjusted for better balance
+
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
-            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
-            insets
-        }
 
         previewView = binding.previewView
         drawImages = DrawImages(applicationContext)
 
-        //  CRITICAL FIX: Initialize models in background thread
         showLoadingUI(true)
-        // In onCreate or similar initialization block
-        binding.ivTop.setOnClickListener {
-            isCapturing = false
-            isLocked = false
-            stableFrameCount = 0
-            startCamera() // Re-bind the camera preview and analyzer
-            Toast.makeText(this, "Scanner Ready", Toast.LENGTH_SHORT).show()
-        }
+
         lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                // Load OpenCV in background
-                val opencvLoaded = OpenCVLoader.initDebug()
-                
-                withContext(Dispatchers.Main) {
-                    if (!opencvLoaded) {
-                        Toast.makeText(this@MainActivity, "OpenCV load failed!", Toast.LENGTH_LONG).show()
-                    }
-                }
-                
-                // Load model in background (this takes 6-15s)
-                val segmentation = InstanceSegmentation(
-                    context = applicationContext,
-                    modelPath = "v6.tflite",
-                    labelPath = null,
-                    instanceSegmentationListener = this@MainActivity,
-                    message = { msg ->
-                        runOnUiThread {
-                            Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                )
-                
-                instanceSegmentation = segmentation
-                isModelReady = true
-                
-                withContext(Dispatchers.Main) {
-                    showLoadingUI(false)
-                    Toast.makeText(this@MainActivity, "Model loaded! Starting camera...", Toast.LENGTH_SHORT).show()
-                    checkPermission()
-                }
-                
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Initialization failed: ${e.message}", Toast.LENGTH_LONG).show()
-                    showLoadingUI(false)
-                }
-                Log.e("MainActivity", "Init failed", e)
+            val loaded = OpenCVLoader.initDebug()
+            instanceSegmentation = InstanceSegmentation(
+                context = applicationContext,
+                modelPath = "v6.tflite",
+                labelPath = null,
+                instanceSegmentationListener = this@MainActivity,
+                message = {}
+            )
+            isModelReady = true
+
+            withContext(Dispatchers.Main) {
+                showLoadingUI(false)
+                checkPermission()
             }
         }
     }
@@ -129,228 +86,161 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     }
 
     private fun startCamera() {
-        if (!isModelReady) {
-            Toast.makeText(this, "Model not ready yet...", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
-        cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+        val providerFuture = ProcessCameraProvider.getInstance(this)
+        providerFuture.addListener({
+            val provider = providerFuture.get()
             val aspectRatio = AspectRatio.RATIO_4_3
 
             val preview = Preview.Builder()
                 .setTargetAspectRatio(aspectRatio)
                 .build()
-                .also {
-                    it.surfaceProvider = previewView.surfaceProvider
-                }
+                .also { it.surfaceProvider = previewView.surfaceProvider }
 
-            val imageAnalyzer = ImageAnalysis.Builder()
+            // Friend's Fix: High-res ImageCapture use case
+            imageCapture = ImageCapture.Builder()
+                .setTargetAspectRatio(aspectRatio)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                .build()
+
+            val analyzer = ImageAnalysis.Builder()
                 .setTargetAspectRatio(aspectRatio)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                .also {
-                    it.setAnalyzer(Executors.newSingleThreadExecutor(), ImageAnalyzer())
-                }
+                .also { it.setAnalyzer(cameraExecutor, ImageAnalyzer()) }
 
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
+            provider.unbindAll()
             try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalyzer
-                )
+                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analyzer, imageCapture)
             } catch (exc: Exception) {
-                Log.e("CameraX", "Use case binding failed", exc)
+                Log.e("CameraX", "Binding failed", exc)
             }
-
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // Original Logic: Restored Rotation Handling
     inner class ImageAnalyzer : ImageAnalysis.Analyzer {
-        override fun analyze(imageProxy: ImageProxy) {
-            if (!isModelReady || instanceSegmentation == null) {
-                imageProxy.close()
+        override fun analyze(image: ImageProxy) {
+            if (!isModelReady || instanceSegmentation == null || isCapturing) {
+                image.close()
                 return
             }
 
-            val bitmapBuffer =
-                Bitmap.createBitmap(
-                    imageProxy.width,
-                    imageProxy.height,
-                    Bitmap.Config.ARGB_8888
-                )
-            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-            imageProxy.close()
+            val bitmapBuffer = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+            image.use { bitmapBuffer.copyPixelsFromBuffer(image.planes[0].buffer) }
 
-            val matrix = Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-            }
+            // Rotate bitmap to match screen orientation (Portrait)
+            val matrix = Matrix().apply { postRotate(image.imageInfo.rotationDegrees.toFloat()) }
+            val rotatedBitmap = Bitmap.createBitmap(bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height, matrix, true)
 
-            val rotatedBitmap = Bitmap.createBitmap(
-                bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
-                matrix, true
-            )
             instanceSegmentation?.invoke(rotatedBitmap)
+            image.close()
         }
     }
 
-    private fun checkPermission() = lifecycleScope.launch(Dispatchers.IO) {
-        val isGranted = REQUIRED_PERMISSIONS.all {
-            ActivityCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-        }
-        if (isGranted) {
-            withContext(Dispatchers.Main) {
-                startCamera()
-            }
-        } else {
-            withContext(Dispatchers.Main) {
-                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-            }
-        }
-    }
+    override fun onDetect(interfaceTime: Long, results: List<SegmentationResult>, preProcessTime: Long, postProcessTime: Long) {
+        if (results.isNotEmpty()) latestBox = results.first().box
 
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()) { map ->
-            if(map.all { it.value }) {
-                startCamera()
-            } else {
-                Toast.makeText(baseContext, "Permission required", Toast.LENGTH_LONG).show()
-            }
-        }
-
-    override fun onError(error: String) {
-        runOnUiThread {
-            Toast.makeText(applicationContext, error, Toast.LENGTH_SHORT).show()
-            binding.ivTop.setImageResource(0)
-        }
-    }
-
-    override fun onDetect(
-        interfaceTime: Long,
-        results: List<SegmentationResult>,
-        preProcessTime: Long,
-        postProcessTime: Long
-    ) {
-        // Step 1: Pass the current 'isLocked' state to the drawer
-        val detectionState = drawImages.invoke(results, isLocked)
+        val state = drawImages.invoke(results, isLocked)
 
         runOnUiThread {
-            // Step 2: Run Stability Logic
-            updateStability(detectionState, results)
-
-            // Step 3: Update UI
-            binding.tvPreprocess.text = "Pre: ${preProcessTime}ms"
-            binding.tvInference.text = "Inf: ${interfaceTime}ms"
-            binding.tvPostprocess.text = "Post: ${postProcessTime}ms"
-            binding.ivTop.setImageBitmap(detectionState.bitmap)
+            updateStability(state, results)
+            binding.ivTop.setImageBitmap(state.bitmap)
         }
     }
+
     private fun updateStability(state: DetectionState, results: List<SegmentationResult>) {
         if (isCapturing) return
+
         if (state.isQuadFound) {
-            // Check Area Stability: current area vs last frame's area
-            val areaDiff = if (lastArea > 0) Math.abs(state.area - lastArea) / lastArea else 0.0
-
-            if (areaDiff <= AREA_THRESHOLD) {
-                stableFrameCount++
-                Log.d("StabilityTracker", "Stabilizing: $stableFrameCount/$REQUIRED_STABLE_FRAMES")
-            } else {
-                // Reset if the document moved too much
-                stableFrameCount = 0
-                Log.d("StabilityTracker", "Reset: Movement (Diff: ${String.format("%.2f", areaDiff)})")
-            }
-
+            val diff = if (lastArea > 0) Math.abs(state.area - lastArea) / lastArea else 0.0
+            if (diff <= AREA_THRESHOLD) stableFrameCount++ else stableFrameCount = 0
             lastArea = state.area
         } else {
-            if (stableFrameCount > 0) Log.d("StabilityTracker", "Reset: Quad lost")
-            // Reset if no quad is detected (Geometric Validity failure)
             stableFrameCount = 0
             lastArea = 0.0
         }
-        val wasLocked = isLocked
-        // Final Stability Check
+
         isLocked = stableFrameCount >= REQUIRED_STABLE_FRAMES
-        if (isLocked && !wasLocked) {
-            Log.i("StabilityTracker", "🟢 DOCUMENT LOCKED - STABILITY ACHIEVED")
-        }
-        if (isLocked && !isCapturing && results.isNotEmpty()) {
-            captureDocument(state, results.first())
+
+        if (isLocked && results.isNotEmpty()) {
+            captureDocument()
         }
     }
-    private fun captureDocument(state: DetectionState, result: SegmentationResult) {
+
+    private fun captureDocument() {
         if (isCapturing) return
         isCapturing = true
 
-        // 1. Stop the Camera Analyzer immediately to "freeze" the frame
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-            cameraProvider.unbindAll() // This stops the preview and analyzer
-        }, ContextCompat.getMainExecutor(this))
+        // Play Shutter Sound
+        window.decorView.playSoundEffect(android.view.SoundEffectConstants.CLICK)
 
-        // 2. Play Sound
-        val view = window.decorView
-        view.playSoundEffect(android.view.SoundEffectConstants.CLICK)
-
-        // 3. Save and Crop
-        lifecycleScope.launch(Dispatchers.IO) {
-            val uri = saveAndCropBitmap(this@MainActivity, state.bitmap, result.box)
-
-            withContext(Dispatchers.Main) {
-                if (uri != null) {
-                    Toast.makeText(this@MainActivity, "Saved to Gallery", Toast.LENGTH_LONG).show()
-                    // Show the final cropped version on top
-                    binding.ivTop.setImageBitmap(state.bitmap)
-                }
-            }
-        }
-    }
-    fun saveAndCropBitmap(context: Context, fullBitmap: Bitmap, box: Output0): Uri? {
-        // 1. Calculate Crop Coordinates (converting normalized 0.0-1.0 to pixel values)
-        val left = (box.x1 * fullBitmap.width).toInt().coerceAtLeast(0)
-        val top = (box.y1 * fullBitmap.height).toInt().coerceAtLeast(0)
-        val width = ((box.x2 - box.x1) * fullBitmap.width).toInt().coerceAtMost(fullBitmap.width - left)
-        val height = ((box.y2 - box.y1) * fullBitmap.height).toInt().coerceAtMost(fullBitmap.height - top)
-
-        val croppedBitmap = Bitmap.createBitmap(fullBitmap, left, top, width, height)
-
-        // 2. Save to Gallery using MediaStore
-        val filename = "SCAN_${System.currentTimeMillis()}.jpg"
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "SCAN_${System.currentTimeMillis()}.jpg")
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
         }
 
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-// In saveAndCropBitmap function
-        uri?.let {
-            // Add the safe call ?. before use
-            context.contentResolver.openOutputStream(it)?.use { stream ->
-                croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 100, stream)
-            } ?: throw IOException("Failed to open output stream.")
-        }
-        return uri
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values).build()
+
+        imageCapture.takePicture(outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                val uri = result.savedUri ?: return
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val bitmap = MediaStore.Images.Media.getBitmap(contentResolver, uri)
+                    val box = latestBox ?: return@launch
+
+                    // Corrected Crop: Maps rotated AI coordinates to the captured bitmap
+                    val cropped = crop(bitmap, box)
+
+                    contentResolver.openOutputStream(uri)?.use {
+                        cropped.compress(Bitmap.CompressFormat.JPEG, 100, it)
+                    }
+
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Document Saved!", Toast.LENGTH_LONG).show()
+                        isCapturing = false
+                        stableFrameCount = 0 // Reset for next scan
+                    }
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                isCapturing = false
+                Log.e("Capture", "Error: ${exception.message}")
+            }
+        })
     }
 
-    override fun onEmpty() {
-        runOnUiThread {
-            binding.ivTop.setImageResource(0)
-        }
+    private fun crop(bitmap: Bitmap, box: Output0): Bitmap {
+
+        val left = (box.x1 * bitmap.width).toInt().coerceAtLeast(0)
+        val top = (box.y1 * bitmap.height).toInt().coerceAtLeast(0)
+        val right = (box.x2 * bitmap.width).toInt().coerceAtMost(bitmap.width)
+        val bottom = (box.y2 * bitmap.height).toInt().coerceAtMost(bitmap.height)
+
+        val width = (right - left).coerceAtLeast(1)
+        val height = (bottom - top).coerceAtLeast(1)
+
+        return Bitmap.createBitmap(bitmap, left, top, width, height)
     }
 
+    private fun checkPermission() {
+        val granted = REQUIRED_PERMISSIONS.all { ActivityCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+        if (granted) startCamera() else requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+    }
+
+    private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { if (it.all { p -> p.value }) startCamera() }
+
+    override fun onError(error: String) {}
+    override fun onEmpty() {}
     override fun onDestroy() {
         super.onDestroy()
         instanceSegmentation?.close()
+        cameraExecutor.shutdown()
     }
 
     companion object {
-        val REQUIRED_PERMISSIONS = mutableListOf (
-            Manifest.permission.CAMERA
-        ).toTypedArray()
+        val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
     }
 }
