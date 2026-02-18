@@ -40,6 +40,8 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
 
     @Volatile
     private var latestBox: Output0? = null
+    @Volatile
+    private var latestPoints: List<org.opencv.core.Point>? = null
 
     // Stability & Capture State
     private var stableFrameCount = 0
@@ -139,9 +141,12 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     }
 
     override fun onDetect(interfaceTime: Long, results: List<SegmentationResult>, preProcessTime: Long, postProcessTime: Long) {
-        if (results.isNotEmpty()) latestBox = results.first().box
-
         val state = drawImages.invoke(results, isLocked)
+
+        // Save the 4 corners for the high-res capture
+        if (state.isQuadFound) {
+            latestPoints = state.quadPoints
+        }
 
         runOnUiThread {
             updateStability(state, results)
@@ -188,10 +193,9 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
                 val uri = result.savedUri ?: return
                 lifecycleScope.launch(Dispatchers.IO) {
                     val bitmap = MediaStore.Images.Media.getBitmap(contentResolver, uri)
-                    val box = latestBox ?: return@launch
+                    val points = latestPoints ?: return@launch // Use the 4 corners
 
-                    // Corrected Crop: Maps rotated AI coordinates to the captured bitmap
-                    val cropped = crop(bitmap, box)
+                    val cropped = crop(bitmap, points) // Performs perspective warp
 
                     contentResolver.openOutputStream(uri)?.use {
                         cropped.compress(Bitmap.CompressFormat.JPEG, 100, it)
@@ -212,17 +216,44 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         })
     }
 
-    private fun crop(bitmap: Bitmap, box: Output0): Bitmap {
+    private fun crop(bitmap: Bitmap, points: List<org.opencv.core.Point>): Bitmap {
+        val srcMat = org.opencv.core.Mat()
+        org.opencv.android.Utils.bitmapToMat(bitmap, srcMat)
 
-        val left = (box.x1 * bitmap.width).toInt().coerceAtLeast(0)
-        val top = (box.y1 * bitmap.height).toInt().coerceAtLeast(0)
-        val right = (box.x2 * bitmap.width).toInt().coerceAtMost(bitmap.width)
-        val bottom = (box.y2 * bitmap.height).toInt().coerceAtMost(bitmap.height)
+        // 1. Map points from Mask space (450x600) to High-Res Photo space
+        val mappedPoints = points.map {
+            org.opencv.core.Point(it.x * bitmap.width / 450.0, it.y * bitmap.height / 600.0)
+        }
 
-        val width = (right - left).coerceAtLeast(1)
-        val height = (bottom - top).coerceAtLeast(1)
+        // 2. Sort points to avoid twisting the image: [TL, TR, BR, BL]
+        val sortedByY = mappedPoints.sortedBy { it.y }
+        val topHalf = sortedByY.take(2).sortedBy { it.x }
+        val bottomHalf = sortedByY.takeLast(2).sortedByDescending { it.x }
+        val sortedQuad = listOf(topHalf[0], topHalf[1], bottomHalf[0], bottomHalf[1])
 
-        return Bitmap.createBitmap(bitmap, left, top, width, height)
+        val srcPointsMat = org.opencv.utils.Converters.vector_Point2f_to_Mat(sortedQuad)
+
+        // 3. Define Output Dimensions (A4 Ratio)
+        val resultWidth = 1200.0
+        val resultHeight = 1650.0
+        val dstPointsMat = org.opencv.utils.Converters.vector_Point2f_to_Mat(listOf(
+            org.opencv.core.Point(0.0, 0.0),
+            org.opencv.core.Point(resultWidth, 0.0),
+            org.opencv.core.Point(resultWidth, resultHeight),
+            org.opencv.core.Point(0.0, resultHeight)
+        ))
+
+        // 4. Warp Perspective (The "Flattening" math)
+        val perspectiveMatrix = org.opencv.imgproc.Imgproc.getPerspectiveTransform(srcPointsMat, dstPointsMat)
+        val dstMat = org.opencv.core.Mat()
+        org.opencv.imgproc.Imgproc.warpPerspective(srcMat, dstMat, perspectiveMatrix, org.opencv.core.Size(resultWidth, resultHeight))
+
+        val resultBitmap = Bitmap.createBitmap(resultWidth.toInt(), resultHeight.toInt(), Bitmap.Config.ARGB_8888)
+        org.opencv.android.Utils.matToBitmap(dstMat, resultBitmap)
+
+        srcMat.release(); dstMat.release(); perspectiveMatrix.release()
+        srcPointsMat.release(); dstPointsMat.release()
+        return resultBitmap
     }
 
     private fun checkPermission() {

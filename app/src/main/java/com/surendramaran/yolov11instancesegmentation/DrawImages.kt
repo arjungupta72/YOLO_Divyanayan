@@ -37,6 +37,7 @@ class DrawImages(private val context: Context) {
 
         var foundQuad = false
         var bestArea = 0.0
+        var bestPoints: List<org.opencv.core.Point>? = null
         val currentColor = if (isLocked) greenColorInt else orangeColorInt
 
         results.forEach { result ->
@@ -73,6 +74,7 @@ class DrawImages(private val context: Context) {
                 if (approx.total() == 4L) {
                     foundQuad = true
                     bestArea = Imgproc.contourArea(approx) // Extract Area for stability tracking
+                    bestPoints = approx.toList() // Capture the 4 corners
                     drawOpenCVPoly(canvas, approx, currentColor)
 
                     contour2f.release()
@@ -88,7 +90,7 @@ class DrawImages(private val context: Context) {
             hierarchy.release()
         }
 
-        return DetectionState(combined, foundQuad, bestArea)
+        return DetectionState(combined, foundQuad, bestArea, bestPoints)
     }
 
     private fun drawOpenCVPoly(canvas: Canvas, poly: MatOfPoint2f, colorInt: Int) {
