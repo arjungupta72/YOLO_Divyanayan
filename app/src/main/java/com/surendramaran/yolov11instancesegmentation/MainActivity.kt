@@ -150,6 +150,9 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
 
         runOnUiThread {
             updateStability(state, results)
+            binding.tvPreprocess.text = "${preProcessTime}ms"
+            binding.tvInference.text = "${interfaceTime}ms"
+            binding.tvPostprocess.text = "${postProcessTime}ms"
             binding.ivTop.setImageBitmap(state.bitmap)
         }
     }
