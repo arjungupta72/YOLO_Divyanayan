@@ -8,6 +8,7 @@ import android.graphics.Matrix
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -38,6 +39,13 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     private var isModelReady = false
     private val cameraExecutor = Executors.newSingleThreadExecutor()
 
+    // In MainActivity.kt
+    private lateinit var tts: TextToSpeech
+    private var lastSpeechTime: Long = 0
+    private val SPEECH_DELAY = 1500L // Only speak every 1.5 seconds
+    private var isTtsReady = false
+
+
     @Volatile
     private var latestBox: Output0? = null
     @Volatile
@@ -61,6 +69,7 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         previewView = binding.previewView
         drawImages = DrawImages(applicationContext)
 
+
         showLoadingUI(true)
 
         lifecycleScope.launch(Dispatchers.IO) {
@@ -77,6 +86,14 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
             withContext(Dispatchers.Main) {
                 showLoadingUI(false)
                 checkPermission()
+            }
+        }
+
+        tts = TextToSpeech(this) { status ->
+            if (status != TextToSpeech.ERROR) {
+                tts.language = java.util.Locale.US
+                isTtsReady = true
+
             }
         }
     }
@@ -98,7 +115,6 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
                 .build()
                 .also { it.surfaceProvider = previewView.surfaceProvider }
 
-            // Friend's Fix: High-res ImageCapture use case
             imageCapture = ImageCapture.Builder()
                 .setTargetAspectRatio(aspectRatio)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
@@ -139,7 +155,73 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
             image.close()
         }
     }
+    private fun provideAudioGuidance(state: DetectionState) {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastSpeechTime < SPEECH_DELAY || isCapturing || !isTtsReady) return
 
+        val points = state.quadPoints
+        if (points == null || points.size < 4) {
+            speak("Searching for document")
+            lastSpeechTime = currentTime
+            return
+        }
+
+        // 1. Edge Detection Logic (Safety Margin)
+        val edgeMargin = 20.0
+        val frameWidth = 450.0
+        val frameHeight = 600.0
+
+        val touchesEdge = points.any {
+            it.x < edgeMargin || it.x > (frameWidth - edgeMargin) ||
+                    it.y < edgeMargin || it.y > (frameHeight - edgeMargin)
+        }
+
+        // 2. Center Calculation
+        val centerX = points.map { it.x }.average()
+        val centerY = points.map { it.y }.average()
+        val screenMidX = frameWidth / 2.0
+        val screenMidY = frameHeight / 2.0
+        val centerThreshold = 60.0
+
+        var instruction = ""
+
+        // 3. Instruction Priority Logic
+
+        // Priority 1: If cutting off, move back immediately
+        if (touchesEdge) {
+            instruction = "Move further away"
+        }
+        // Priority 2: Distance check (if too small)
+        else if (state.area < 18000.0) {
+            instruction = "Move closer"
+        }
+        // Priority 3: Horizontal Alignment
+        else if (centerX < screenMidX - centerThreshold) {
+            instruction = "Move Left"
+        } else if (centerX > screenMidX + centerThreshold) {
+            instruction = "Move Right"
+        }
+        // Priority 4: Vertical Alignment
+        else if (centerY < screenMidY - centerThreshold) {
+            instruction = "Move Up"
+        } else if (centerY > screenMidY + centerThreshold) {
+            instruction = "Move Down"
+        }
+
+        // 4. Final State
+        if (instruction.isEmpty()) {
+            instruction = if (isLocked) "Hold still" else "Centered"
+        }
+
+        speak(instruction)
+        lastSpeechTime = currentTime
+    }
+    private fun speak(text: String) {
+        if (isTtsReady) {
+            // "GuidanceID" helps the system track this specific speech request
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "GuidanceID")
+        }
+    }
     override fun onDetect(interfaceTime: Long, results: List<SegmentationResult>, preProcessTime: Long, postProcessTime: Long) {
         val state = drawImages.invoke(results, isLocked)
 
@@ -154,6 +236,7 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
             binding.tvInference.text = "${interfaceTime}ms"
             binding.tvPostprocess.text = "${postProcessTime}ms"
             binding.ivTop.setImageBitmap(state.bitmap)
+            provideAudioGuidance(state)
         }
     }
 
@@ -269,6 +352,10 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     override fun onError(error: String) {}
     override fun onEmpty() {}
     override fun onDestroy() {
+        if (::tts.isInitialized) {
+            tts.stop()
+            tts.shutdown()
+        }
         super.onDestroy()
         instanceSegmentation?.close()
         cameraExecutor.shutdown()
