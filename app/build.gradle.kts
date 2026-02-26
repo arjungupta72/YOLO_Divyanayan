@@ -76,7 +76,7 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite-metadata:0.4.4")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
-    
+    implementation("com.google.mlkit:text-recognition:16.0.0")
 
     val cameraxVersion = "1.4.1"
 

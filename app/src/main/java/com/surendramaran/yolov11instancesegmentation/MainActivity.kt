@@ -34,20 +34,16 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     private lateinit var previewView: PreviewView
     private lateinit var drawImages: DrawImages
     private lateinit var imageCapture: ImageCapture
-
+    private val textRecognizer = com.google.mlkit.vision.text.TextRecognition.getClient(com.google.mlkit.vision.text.latin.TextRecognizerOptions.DEFAULT_OPTIONS)
     private var instanceSegmentation: InstanceSegmentation? = null
     private var isModelReady = false
     private val cameraExecutor = Executors.newSingleThreadExecutor()
 
-    // In MainActivity.kt
     private lateinit var tts: TextToSpeech
     private var lastSpeechTime: Long = 0
     private val SPEECH_DELAY = 1500L // Only speak every 1.5 seconds
     private var isTtsReady = false
 
-
-    @Volatile
-    private var latestBox: Output0? = null
     @Volatile
     private var latestPoints: List<org.opencv.core.Point>? = null
 
@@ -56,7 +52,7 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
     private var lastArea = 0.0
     private var isLocked = false
     private var isCapturing = false
-
+    private var isResultMode = false
     private val AREA_THRESHOLD = 0.10
     private val REQUIRED_STABLE_FRAMES = 15 // Adjusted for better balance
 
@@ -136,10 +132,9 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Original Logic: Restored Rotation Handling
     inner class ImageAnalyzer : ImageAnalysis.Analyzer {
         override fun analyze(image: ImageProxy) {
-            if (!isModelReady || instanceSegmentation == null || isCapturing) {
+            if (!isModelReady || instanceSegmentation == null || isCapturing || isResultMode) {
                 image.close()
                 return
             }
@@ -216,10 +211,14 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         speak(instruction)
         lastSpeechTime = currentTime
     }
-    private fun speak(text: String) {
-        if (isTtsReady) {
-            // "GuidanceID" helps the system track this specific speech request
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "GuidanceID")
+    private fun speak(text: String, isPriority: Boolean = false) {
+        val currentTime = System.currentTimeMillis()
+        // If it's a priority (OCR), speak anyway. Otherwise, check the delay.
+        if (isPriority || (currentTime - lastSpeechTime >= SPEECH_DELAY)) {
+            if (::tts.isInitialized) {
+                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "GuidanceID")
+                lastSpeechTime = currentTime
+            }
         }
     }
     override fun onDetect(interfaceTime: Long, results: List<SegmentationResult>, preProcessTime: Long, postProcessTime: Long) {
@@ -289,6 +288,7 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
 
                     withContext(Dispatchers.Main) {
                         Toast.makeText(this@MainActivity, "Document Saved!", Toast.LENGTH_LONG).show()
+                        runOCR(cropped)
                         isCapturing = false
                         stableFrameCount = 0 // Reset for next scan
                     }
@@ -342,6 +342,45 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
         return resultBitmap
     }
 
+    private fun runOCR(bitmap: Bitmap) {
+        val image = com.google.mlkit.vision.common.InputImage.fromBitmap(bitmap, 0)
+
+        textRecognizer.process(image)
+            .addOnSuccessListener { visionText ->
+                val resultText = visionText.text
+                if (resultText.isNotBlank()) {
+                    isResultMode = true // Stop the AI analyzer
+
+                    binding.tvDetectedText.text = resultText
+                    binding.ocrResultContainer.visibility = View.VISIBLE
+
+                    binding.btnCloseOcr.setOnClickListener {
+                        binding.ocrResultContainer.visibility = View.GONE
+                        isResultMode = false // Resume the AI analyzer
+                        tts.stop()
+                    }
+
+                    // Use the priority flag to ensure it speaks immediately
+                    speak("Scan complete. Content: $resultText", isPriority = true)
+                } else {
+                    speak("Scan complete, but no text was detected.")
+                    isCapturing = false // Reset capture flag if no text found
+                }
+            }
+            .addOnFailureListener { e ->
+                speak("OCR failed to process the image.")
+                isCapturing = false
+            }
+    }
+    override fun onBackPressed() {
+        if (binding.ocrResultContainer.visibility == View.VISIBLE) {
+            binding.ocrResultContainer.visibility = View.GONE
+            isResultMode = false // Resume AI
+            tts.stop()
+        } else {
+            super.onBackPressed()
+        }
+    }
     private fun checkPermission() {
         val granted = REQUIRED_PERMISSIONS.all { ActivityCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
         if (granted) startCamera() else requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
@@ -356,6 +395,7 @@ class MainActivity : AppCompatActivity(), InstanceSegmentation.InstanceSegmentat
             tts.stop()
             tts.shutdown()
         }
+        textRecognizer.close()
         super.onDestroy()
         instanceSegmentation?.close()
         cameraExecutor.shutdown()
